@@ -1,0 +1,550 @@
+use ai_usage_monitor::{Discovery, Observation, Quota, Service, Snapshot, StatusReader};
+use std::{
+    any::Any,
+    future::{poll_fn, Future},
+    ops::Deref,
+    pin::{pin, Pin},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    task::Poll,
+    time::Duration,
+};
+use tokio::sync::{oneshot, Notify};
+
+#[derive(Default)]
+struct Controls {
+    codex_offline: AtomicBool,
+    codex_release: Notify,
+    claude_entered: Notify,
+    claude_release: Notify,
+    blocking_read: Mutex<Option<oneshot::Receiver<()>>>,
+}
+impl Controls {
+    fn blocking_scan() -> (Arc<Self>, oneshot::Sender<()>) {
+        let controls = Arc::new(Self::default());
+        let (release, blocked) = oneshot::channel();
+        *controls.blocking_read.lock().unwrap() = Some(blocked);
+        (controls, release)
+    }
+
+    async fn wait_for_scan(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.claude_entered.notified())
+            .await
+            .expect("synthetic scan did not enter");
+    }
+}
+#[derive(Default)]
+struct D(bool);
+impl Discovery for D {
+    fn installed(&self, id: &str) -> bool {
+        id == "codex" || (id == "claude" && self.0)
+    }
+}
+#[derive(Default)]
+struct R(Arc<Controls>);
+impl StatusReader for R {
+    fn read(&self, id: String) -> Pin<Box<dyn Future<Output = Result<Observation, String>> + Send>> {
+        let controls = self.0.clone();
+        Box::pin(async move {
+            if id == "claude" {
+                let blocking = controls.blocking_read.lock().unwrap().take();
+                if let Some(release) = blocking {
+                    return Self::scan_blocking(
+                        move |_| {
+                            controls.claude_entered.notify_one();
+                            let _ = release.blocking_recv();
+                            Ok(Observation {
+                                message: Some("Synthetic stale observation".into()),
+                                ..Default::default()
+                            })
+                        },
+                        "Synthetic scan failed",
+                    )
+                    .await;
+                }
+                controls.claude_entered.notify_one();
+                controls.claude_release.notified().await;
+                return Ok(Observation::default());
+            }
+            if controls.codex_offline.load(Ordering::SeqCst) {
+                controls.codex_release.notified().await;
+                return Err("Synthetic status disconnected".into());
+            }
+            Ok(Observation {
+                quotas: vec![Quota {
+                    id: "session".into(),
+                    label: "Session".into(),
+                    remaining_percent: Some(62.0),
+                    resets_at: None,
+                    source: "Synthetic".into(),
+                }],
+                ..Default::default()
+            })
+        })
+    }
+}
+type Backend = Service<D, R>;
+struct ReportingClient;
+struct BillingStore<T> {
+    entered: Notify,
+    release: Notify,
+    marker: std::marker::PhantomData<T>,
+}
+impl<T> BillingStore<T> {
+    async fn refresh(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+type State<'a, T> = &'a T;
+fn decorate(snapshot: Snapshot, _: &BillingStore<ReportingClient>) -> Snapshot {
+    snapshot
+}
+#[derive(Default)]
+struct AuthStub;
+impl AuthStub {
+    async fn active_tool(&self) -> Option<String> {
+        None
+    }
+    async fn cancel(&self, _: Option<&str>) {}
+    async fn start(&self, tool: &str, choice: &str) -> Result<ai_usage_monitor::auth::AuthView, String> {
+        if choice == "success" {
+            Ok(ai_usage_monitor::auth::AuthView {
+                attempt_id: "fixture".into(),
+                tool_id: tool.into(),
+                progress: ai_usage_monitor::auth_types::AuthProgress::waiting("device_code"),
+            })
+        } else {
+            Err("Synthetic sign-in".into())
+        }
+    }
+}
+#[derive(Default)]
+struct Authentication {
+    gate: tokio::sync::Mutex<()>,
+    manager: AuthStub,
+}
+#[derive(Clone, PartialEq, Debug)]
+struct MenuItem(String, bool);
+impl MenuItem {
+    fn new(_: &App, text: String, enabled: bool, _: Option<&str>) -> Result<Self, ()> {
+        Ok(Self(text, enabled))
+    }
+}
+struct Panel {
+    menu: Menu,
+}
+struct Menu(Mutex<Vec<MenuItem>>);
+impl Menu {
+    fn items(&self) -> Result<Vec<MenuItem>, ()> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn remove(&self, item: &MenuItem) -> Result<(), ()> {
+        let mut items = self.0.lock().unwrap();
+        let index = items.iter().position(|x| x == item).unwrap();
+        items.remove(index);
+        Ok(())
+    }
+    fn append(&self, item: &MenuItem) -> Result<(), ()> {
+        self.0.lock().unwrap().push(item.clone());
+        Ok(())
+    }
+}
+struct Inner {
+    queue: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    defer: AtomicBool,
+    backend: Backend,
+    billing: BillingStore<ReportingClient>,
+    tooltip: Mutex<String>,
+    panel: Panel,
+}
+#[derive(Clone)]
+struct App(Arc<Inner>);
+impl Deref for App {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+struct Tray<'a>(&'a Mutex<String>);
+impl Tray<'_> {
+    fn set_tooltip(&self, text: Option<String>) -> Result<(), ()> {
+        *self.0.lock().unwrap() = text.unwrap_or_default();
+        Ok(())
+    }
+}
+impl App {
+    fn new(backend: Backend) -> Self {
+        Self(Arc::new(Inner {
+            queue: Mutex::new(vec![]),
+            defer: false.into(),
+            backend,
+            billing: BillingStore {
+                entered: Notify::new(),
+                release: Notify::new(),
+                marker: std::marker::PhantomData,
+            },
+            tooltip: Mutex::new(String::new()),
+            panel: Panel {
+                menu: Menu(Mutex::new(actions())),
+            },
+        }))
+    }
+    fn state<T: Any>(&self) -> &T {
+        [&self.backend as &dyn Any, &self.billing, &self.panel]
+            .into_iter()
+            .find_map(|s| s.downcast_ref())
+            .unwrap()
+    }
+    fn tray_by_id(&self, _: &str) -> Option<Tray<'_>> {
+        Some(Tray(&self.tooltip))
+    }
+    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, work: F) -> Result<(), ()> {
+        if self.defer.load(Ordering::SeqCst) {
+            self.queue.lock().unwrap().push(Box::new(work));
+        } else {
+            work();
+        }
+        Ok(())
+    }
+    async fn publish_quota(&self) {
+        self.backend.scan_agents();
+        self.backend.set_permission("codex",true).unwrap();
+        self.backend.refresh_usage().await;
+        publish_panel(self).unwrap();
+        self.check_menu(true);
+    }
+    fn check_menu(&self, visible: bool) {
+        let mut expected = actions();
+        if visible {
+            expected.push(MenuItem("Codex · Session: 62% left".into(), false));
+        }
+        assert_eq!(self.panel.menu.items().unwrap(), expected);
+        assert_eq!(self.tooltip.lock().unwrap().contains("62%"), visible);
+    }
+    fn drain_gui(&self) {
+        let tasks = std::mem::take(&mut *self.queue.lock().unwrap());
+        for task in tasks {
+            task();
+        }
+    }
+}
+fn actions() -> Vec<MenuItem> {
+    ["open", "refresh", "quit"]
+        .map(|label| MenuItem(label.into(), true))
+        .to_vec()
+}
+// INSERT PRODUCTION FUNCTIONS
+#[tokio::test]
+async fn native_panel_must_not_publish_revoked_quota_after_slow_billing() {
+    let app = App::new(Service::new(D::default(), R::default()));
+    app.backend.scan_agents();
+    app.backend.set_permission("codex", true).unwrap();
+    let refresh = refresh_panel(app.clone());
+    let revoke = async {
+        app.billing.entered.notified().await;
+        let auth = Authentication::default();
+        let snapshot = set_permission(
+            &app.backend,
+            "codex".into(),
+            false,
+            &app.billing,
+            app.clone(),
+            &auth,
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.agents[0].quotas.is_empty());
+        app.check_menu(false);
+        app.billing.release.notify_one();
+    };
+    tokio::join!(refresh, revoke);
+    app.check_menu(false);
+}
+
+#[tokio::test]
+async fn revocation_clears_the_menu_and_tooltip_without_waiting_for_billing() {
+    let app = App::new(Service::new(D::default(), R::default()));
+    app.publish_quota().await;
+    let auth = Authentication::default();
+    set_permission(&app.backend, "codex".into(), false, &app.billing, app.clone(), &auth)
+        .await.unwrap();
+    app.check_menu(false);
+}
+
+#[tokio::test]
+async fn queued_gui_publication_reads_post_revocation_state() {
+    let app = App::new(Service::new(D::default(), R::default()));
+    app.publish_quota().await;
+    app.defer.store(true, Ordering::SeqCst);
+    publish_panel(&app).unwrap();
+    let auth = Authentication::default();
+    let mut revoke = pin!(set_permission(
+        &app.backend, "codex".into(), false, &app.billing, app.clone(), &auth,
+    ));
+    let first = poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await;
+    let tasks = std::mem::take(&mut *app.queue.lock().unwrap());
+    assert_eq!(tasks.len(), 2);
+    for task in tasks.into_iter().rev() {
+        task();
+        app.check_menu(false);
+    }
+    if first.is_pending() {
+        revoke.await.unwrap();
+    }
+    assert_eq!(*app.tooltip.lock().unwrap(), "EZTYN AI MONITOR · 1 detected tool");
+}
+
+#[tokio::test]
+async fn failed_durable_revoke_still_clears_published_quota() {
+    let storage = std::env::temp_dir().join("failed-revoke");
+    let app = App::new(Service::with_storage(D::default(), R::default(), &storage));
+    app.publish_quota().await;
+    let blocked = block_database(&storage);
+    let auth = Authentication::default();
+    let result = set_permission(
+        &app.backend, "codex".into(), false, &app.billing, app.clone(), &auth,
+    ).await;
+    assert!(result.unwrap_err().contains("storage"));
+    drop(blocked);
+    app.check_menu(false);
+}
+
+#[tokio::test]
+async fn native_sign_in_clears_quota_even_if_persisting_the_pause_fails() {
+    for fail_pause in [false, true] {
+        let storage = std::env::temp_dir().join(format!("auth-pause-{fail_pause}"));
+        let app = App::new(Service::with_storage(D::default(), R::default(), &storage));
+        app.publish_quota().await;
+        let _blocked = fail_pause.then(|| block_database(&storage));
+        let auth = Authentication::default();
+        let result =
+            auth_start("codex".into(), "synthetic".into(), &app.backend, &auth, app.clone()).await;
+        let expected = if fail_pause { STORAGE_ERROR } else { "Synthetic sign-in" };
+        assert_eq!(result.err().unwrap(), expected);
+        app.check_menu(false);
+    }
+}
+
+const STORAGE_ERROR: &str = "Local history storage unavailable. Saved permissions/history could not be confirmed; check local storage and retry. Revoke failures may leave saved data on disk.";
+fn block_database(storage: &std::path::Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(storage.join("monitor-usage.sqlite3")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    db
+}
+
+#[tokio::test]
+async fn revoke_acknowledges_only_after_the_old_quota_is_removed() {
+    let mut early = Vec::new();
+    for fail in [false, true] {
+        let storage = std::env::temp_dir().join(format!("revoke-ack-{fail}"));
+        let app = App::new(Service::with_storage(D::default(), R::default(), &storage));
+        app.publish_quota().await;
+        let path = storage.join("monitor-usage.sqlite3-wal");
+        let saved = std::fs::read(&path).unwrap();
+        let _blocked = fail.then(|| block_database(&storage));
+        app.defer.store(true, Ordering::SeqCst);
+        let auth = Authentication::default();
+        let mut revoke = pin!(set_permission(
+            &app.backend, "codex".into(), false, &app.billing, app.clone(), &auth,
+        ));
+        let first = poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await;
+        app.check_menu(true);
+        app.drain_gui();
+        app.check_menu(false);
+        let result = match first {
+            Poll::Ready(result) => {
+                early.push(fail);
+                result
+            }
+            Poll::Pending => tokio::time::timeout(Duration::from_secs(1), revoke).await.unwrap(),
+        };
+        if fail {
+            assert_eq!(result.unwrap_err(), STORAGE_ERROR);
+            assert_eq!(std::fs::read(path).unwrap(), saved);
+        } else {
+            let agent = &result.unwrap().agents[0];
+            assert!(!agent.monitoring_allowed);
+            assert!(agent.quotas.is_empty());
+        }
+    }
+    assert!(
+        early.is_empty(),
+        "Revoke acknowledged before native menu was cleared (persistence failure: {early:?})"
+    );
+}
+
+#[tokio::test]
+async fn sign_in_acknowledges_only_after_the_previous_accounts_quota_is_removed() {
+    let mut early = Vec::new();
+    for fail in [false, true] {
+        let storage = std::env::temp_dir().join(format!("sign-in-ack-{fail}"));
+        let app = App::new(Service::with_storage(D::default(), R::default(), &storage));
+        app.publish_quota().await;
+        let path = storage.join("monitor-usage.sqlite3-wal");
+        let saved = std::fs::read(&path).unwrap();
+        let _blocked = fail.then(|| block_database(&storage));
+        app.defer.store(true, Ordering::SeqCst);
+        let auth = Authentication::default();
+        let mut login = pin!(auth_start(
+            "codex".into(), "success".into(), &app.backend, &auth, app.clone(),
+        ));
+        let first = poll_fn(|cx| Poll::Ready(login.as_mut().poll(cx))).await;
+        app.check_menu(true);
+        app.drain_gui();
+        app.check_menu(false);
+        let result = match first {
+            Poll::Ready(result) => {
+                early.push(fail);
+                result
+            }
+            Poll::Pending => tokio::time::timeout(Duration::from_secs(1), login).await.unwrap(),
+        };
+        if fail {
+            assert_eq!(result.err().unwrap(), STORAGE_ERROR);
+            assert_eq!(std::fs::read(path).unwrap(), saved);
+        } else {
+            assert_eq!(result.unwrap().progress.state, "waiting");
+        }
+    }
+    assert!(
+        early.is_empty(),
+        "Sign-in acknowledged before native menu was cleared (persistence failure: {early:?})"
+    );
+}
+
+#[tokio::test]
+async fn disconnected_quota_does_not_wait_for_a_slow_connector() {
+    let controls = Arc::new(Controls::default());
+    let app = App::new(Service::new(D(true), R(controls.clone())));
+    app.publish_quota().await;
+    app.backend.set_permission("claude", true).unwrap();
+    // The production status cache uses std::time::Instant and expires after 30 s.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    controls.codex_offline.store(true, Ordering::SeqCst);
+    app.defer.store(true, Ordering::SeqCst);
+    let mut refresh = pin!(refresh_panel(app.clone()));
+    assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await.is_pending());
+    app.drain_gui();
+    app.check_menu(true);
+    controls.codex_release.notify_one();
+    assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await.is_pending());
+    tokio::time::timeout(Duration::from_secs(1), controls.claude_entered.notified())
+        .await
+        .expect("Claude never started");
+    app.drain_gui();
+    app.check_menu(false);
+    controls.claude_release.notify_one();
+    app.billing.release.notify_one();
+    refresh.await;
+    app.drain_gui();
+    app.check_menu(false);
+}
+
+#[tokio::test]
+async fn native_sign_in_does_not_wait_for_an_unrelated_connector() {
+    let controls = Arc::new(Controls::default());
+    let app = App::new(Service::new(D(true), R(controls.clone())));
+    app.publish_quota().await;
+    app.backend.set_permission("claude", true).unwrap();
+    let ((), ()) = tokio::join!(refresh_panel(app.clone()), async {
+        controls.claude_entered.notified().await;
+        let auth = Authentication::default();
+        let result = tokio::time::timeout(Duration::from_secs(1), auth_start(
+            "codex".into(), "success".into(), &app.backend, &auth, app.clone(),
+        )).await;
+        controls.claude_release.notify_one();
+        app.billing.release.notify_one();
+        assert_eq!(result.expect("Sign-in waited for Claude").unwrap().progress.state, "waiting");
+        app.check_menu(false);
+    });
+}
+
+#[tokio::test]
+async fn revoke_waits_for_an_entered_blocking_scan_even_if_refresh_was_dropped() {
+    for mode in ["active", "dropped", "timed out"] {
+        let (controls, release) = Controls::blocking_scan();
+        let app = App::new(Service::new(D(true), R(controls.clone())));
+        app.backend.scan_agents();
+        app.backend.set_permission("claude", true).unwrap();
+        let mut refresh = Some(Box::pin(app.backend.refresh_usage()));
+        assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().unwrap().as_mut().poll(cx)))
+            .await
+            .is_pending());
+        controls.wait_for_scan().await;
+        match mode {
+            "dropped" => drop(refresh.take()),
+            "timed out" => {
+                let timed_out = refresh.take().unwrap().await;
+                assert_eq!(timed_out.agents[1].message, "Status request timed out.");
+            }
+            _ => {}
+        }
+
+        let auth = Authentication::default();
+        let mut revoke = pin!(set_permission(
+            &app.backend, "claude".into(), false, &app.billing, app.clone(), &auth,
+        ));
+        let first = poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await;
+        assert!(!app.backend.with_snapshot(|s| s.agents[1].monitoring_allowed));
+        if let Some(refresh) = refresh {
+            let cancelled = tokio::time::timeout(Duration::from_secs(2), refresh)
+                .await.unwrap();
+            assert!(!cancelled.agents[1].connected);
+        }
+        assert!(first.is_pending(), "Revoke acknowledged before the scan exited ({mode})");
+        let mut unrelated = pin!(set_permission(
+            &app.backend, "codex".into(), false, &app.billing, app.clone(), &auth,
+        ));
+        assert!(matches!(
+            poll_fn(|cx| Poll::Ready(unrelated.as_mut().poll(cx))).await,
+            Poll::Ready(Ok(_))
+        ));
+        assert!(poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await.is_pending());
+        release.send(()).unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), revoke)
+            .await.unwrap().unwrap();
+        let agent = &snapshot.agents[1];
+        assert!(!agent.monitoring_allowed && !agent.connected);
+        assert_eq!(agent.message, "Permission revoked. Saved monitor history and remembered approval deleted; native credentials are unchanged.");
+    }
+}
+
+#[tokio::test]
+async fn native_sign_in_waits_for_the_old_read_and_cannot_launch_after_revoke() {
+    for revoked in [false, true] {
+        let (controls, release) = Controls::blocking_scan();
+        let app = App::new(Service::new(D(true), R(controls.clone())));
+        app.backend.scan_agents();
+        app.backend.set_permission("claude", true).unwrap();
+        let mut refresh = Box::pin(app.backend.refresh_usage());
+        assert!(poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await.is_pending());
+        controls.wait_for_scan().await;
+        drop(refresh);
+
+        let auth = Authentication::default();
+        let mut login = pin!(auth_start(
+            "claude".into(), "success".into(), &app.backend, &auth, app.clone(),
+        ));
+        assert!(poll_fn(|cx| Poll::Ready(login.as_mut().poll(cx))).await.is_pending());
+        assert!(!app.backend.with_snapshot(|s| s.agents[1].monitoring_allowed));
+        if revoked {
+            let mut revoke = pin!(set_permission(
+                &app.backend, "claude".into(), false, &app.billing, app.clone(), &auth,
+            ));
+            assert!(poll_fn(|cx| Poll::Ready(revoke.as_mut().poll(cx))).await.is_pending());
+            release.send(()).unwrap();
+            let (login, revoke) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(login, revoke)
+            }).await.unwrap();
+            assert_eq!(login.err().unwrap(), "Native sign-in was cancelled before it started.");
+            assert!(!revoke.unwrap().agents[1].monitoring_allowed);
+        } else {
+            release.send(()).unwrap();
+            let login = tokio::time::timeout(Duration::from_secs(2), login).await.unwrap();
+            assert_eq!(login.unwrap().progress.state, "waiting");
+        }
+    }
+}
