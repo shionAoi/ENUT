@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Only the local main window may invoke application status commands; no shell, filesystem, or HTTP plugins.",
+  "windows": ["main"],
+  "permissions": []
+}

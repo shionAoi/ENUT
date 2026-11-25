@@ -1,0 +1,37 @@
+[package]
+name = "ai-usage-monitor"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "ai_usage_monitor"
+
+[[bin]]
+name = "ai-usage-monitor"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = []
+desktop = ["dep:tauri", "dep:tauri-build"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "=0.38.0", features = ["bundled"] }
+sha2 = "0.10"
+toml = "0.8"
+serde_yaml = "0.9"
+zeroize = "1"
+portable-pty = "=0.9.0"
+cap-std = "4"
+cap-fs-ext = "4"
+libc = "0.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "process", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tauri = { version = "2", optional = true, features = ["tray-icon"] }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true , features = [] }
