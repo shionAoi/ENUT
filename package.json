@@ -1,0 +1,26 @@
+{
+  "name": "ai-usage-monitor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "test:panel": "node --test tests/native/*.test.ts",
+    "test:layout": "node --test tests/browser/*.test.ts",
+    "desktop:dev": "tauri dev --features desktop",
+    "desktop:build": "node scripts/desktop-build.mjs",
+    "desktop:build:windows": "node scripts/desktop-build.mjs --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "typescript": "7.0.2",
+    "vite": "8.3.6"
+  }
+}

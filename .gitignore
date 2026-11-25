@@ -1,0 +1,37 @@
+# Dependencies and build output
+node_modules/
+dist/
+artifacts/
+src-tauri/gen/
+src-tauri/target/
+target/
+
+# AI agent workspaces, plans, and generated notes
+.agents/
+.atl/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.taste-skill/
+.windsurf/
+.aider*
+odd/
+docs/superpowers/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+
+# Local credentials and environment
+.aws/
+.env
+.env.*
+*.pem
+*.key
+
+# Logs and OS files
+*.log
+.DS_Store
+
+# Semgrep reports
+reports
