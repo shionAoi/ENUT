@@ -19,6 +19,8 @@
 
 </div>
 
+**[Download ENUT](https://github.com/shionAoi/ENUT/releases/tag/Releases)** for Windows x64 (`.exe` or `.msi`) or Linux x86-64 (`.deb`, `.rpm`, or `.AppImage`).
+
 ## Table of Contents
 - [Table of Contents](#table-of-contents)
 - [Install and run](#install-and-run)
